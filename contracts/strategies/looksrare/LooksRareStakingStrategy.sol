@@ -5,21 +5,17 @@ import "@openzeppelin/contracts/math/SafeMath.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20Detailed.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "../../base/interface/uniswap/IUniswapV2Router02.sol";
-import "../../base/interface/IStrategy.sol";
-import "../../base/interface/IVault.sol";
-import "../../base/upgradability/BaseUpgradeableStrategy.sol";
 import "../../base/interface/uniswap/IUniswapV2Pair.sol";
-import "./interface/IcvxRewardPool.sol";
+import "../../base/interface/IStrategy.sol";
+import "../../base/upgradability/BaseUpgradeableStrategyUL.sol";
+import "./interface/IFeeSharingSystem.sol";
 
-contract ConvexStrategyCVX is IStrategy, BaseUpgradeableStrategy {
+contract LooksRareStakingStrategy is IStrategy, BaseUpgradeableStrategyUL {
 
   using SafeMath for uint256;
   using SafeERC20 for IERC20;
 
-  address public constant sushiswapRouterV2 = address(0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F);
-  address[] public liquidationPath;
-
-  constructor() public BaseUpgradeableStrategy() {
+  constructor() public BaseUpgradeableStrategyUL() {
   }
 
   function initializeBaseStrategy(
@@ -30,23 +26,22 @@ contract ConvexStrategyCVX is IStrategy, BaseUpgradeableStrategy {
     address _rewardToken
   ) public initializer {
 
-    BaseUpgradeableStrategy.initialize(
+    BaseUpgradeableStrategyUL.initialize(
       _storage,
       _underlying,
       _vault,
       _rewardPool,
       _rewardToken,
-      300, // profit sharing numerator
+      300,  // profit sharing numerator
       1000, // profit sharing denominator
       true, // sell
-      1e18, // sell floor
-      12 hours // implementation change delay
+      0, // sell floor
+      12 hours, // implementation change delay
+      address(0x7882172921E99d590E097cD600554339fBDBc480) //UL Registry
     );
 
-    address _lpt;
-    _lpt = IcvxRewardPool(_rewardPool).stakingToken();
-    require(_lpt == underlying(), "Pool Info does not match underlying");
-    liquidationPath = new address[](0);
+    address _lpt = IFeeSharingSystem(rewardPool()).rewardToken();
+    require(_lpt == _rewardToken, "Pool Info does not match rewardToken");
   }
 
   function depositArbCheck() public view returns(bool) {
@@ -54,24 +49,22 @@ contract ConvexStrategyCVX is IStrategy, BaseUpgradeableStrategy {
   }
 
   function rewardPoolBalance() internal view returns (uint256 bal) {
-      bal = IcvxRewardPool(rewardPool()).balanceOf(address(this));
+      bal = IFeeSharingSystem(rewardPool()).calculateSharesValueInLOOKS(address(this));
   }
 
   function exitRewardPool() internal {
       uint256 stakedBalance = rewardPoolBalance();
       if (stakedBalance != 0) {
-          IcvxRewardPool(rewardPool()).withdrawAll(true);
+          // bool flag param for claiming reward tokens set to true
+          IFeeSharingSystem(rewardPool()).withdrawAll(true);
       }
-  }
-
-  function partialWithdrawalRewardPool(uint256 amount) internal {
-    IcvxRewardPool(rewardPool()).withdraw(amount, false);  //don't claim rewards at this point
   }
 
   function emergencyExitRewardPool() internal {
     uint256 stakedBalance = rewardPoolBalance();
     if (stakedBalance != 0) {
-        IcvxRewardPool(rewardPool()).withdrawAll(false); //don't claim rewards
+        // bool flag param for claiming reward tokens set to false
+        IFeeSharingSystem(rewardPool()).withdrawAll(false);
     }
   }
 
@@ -81,9 +74,16 @@ contract ConvexStrategyCVX is IStrategy, BaseUpgradeableStrategy {
 
   function enterRewardPool() internal {
     uint256 entireBalance = IERC20(underlying()).balanceOf(address(this));
+
+    if(entireBalance < 1e18) {
+      // not enough LOOKS to deposit, must be at least 1 LOOK
+      return;
+    }
     IERC20(underlying()).safeApprove(rewardPool(), 0);
     IERC20(underlying()).safeApprove(rewardPool(), entireBalance);
-    IcvxRewardPool(rewardPool()).stakeAll();
+
+    // bool flag param for claiming reward tokens set to false
+    IFeeSharingSystem(rewardPool()).deposit(entireBalance, false);
   }
 
   /*
@@ -99,18 +99,10 @@ contract ConvexStrategyCVX is IStrategy, BaseUpgradeableStrategy {
   /*
   *   Resumes the ability to invest into the underlying reward pools
   */
-
   function continueInvesting() public onlyGovernance {
     _setPausedInvesting(false);
   }
 
-  function setLiquidationPath(address [] memory _route) public onlyGovernance {
-    require(_route[0] == rewardToken(), "Path should start with rewardToken");
-    require(_route[_route.length-1] == underlying(), "Path should end with underlying");
-    liquidationPath = _route;
-  }
-
-  // We assume that all the tradings can be done on Sushiswap
   function _liquidateReward() internal {
     uint256 rewardBalance = IERC20(rewardToken()).balanceOf(address(this));
     if (!sell() || rewardBalance < sellFloor()) {
@@ -122,23 +114,20 @@ contract ConvexStrategyCVX is IStrategy, BaseUpgradeableStrategy {
     notifyProfitInRewardToken(rewardBalance);
     uint256 remainingRewardBalance = IERC20(rewardToken()).balanceOf(address(this));
 
-    if (remainingRewardBalance == 0) {
+    if (remainingRewardBalance <= 0) {
       return;
     }
 
-    // allow Uniswap to sell our reward
-    IERC20(rewardToken()).safeApprove(sushiswapRouterV2, 0);
-    IERC20(rewardToken()).safeApprove(sushiswapRouterV2, remainingRewardBalance);
+    IERC20(rewardToken()).safeApprove(universalLiquidator(), 0);
+    IERC20(rewardToken()).safeApprove(universalLiquidator(), remainingRewardBalance);
 
     // we can accept 1 as minimum because this is called only by a trusted role
-    uint256 amountOutMin = 1;
-
-    IUniswapV2Router02(sushiswapRouterV2).swapExactTokensForTokens(
+    ILiquidator(universalLiquidator()).swapTokenOnMultipleDEXes(
       remainingRewardBalance,
-      amountOutMin,
-      liquidationPath,
-      address(this),
-      block.timestamp
+      1,
+      address(this), // target
+      storedLiquidationDexes[rewardToken()][underlying()],
+      storedLiquidationPaths[rewardToken()][underlying()]
     );
   }
 
@@ -146,8 +135,6 @@ contract ConvexStrategyCVX is IStrategy, BaseUpgradeableStrategy {
   *   Stakes everything the strategy holds into the reward pool
   */
   function investAllUnderlying() internal onlyNotPausedInvesting {
-    // this check is needed, because most of the SNX reward pools will revert if
-    // you try to stake(0).
     if(IERC20(underlying()).balanceOf(address(this)) > 0) {
       enterRewardPool();
     }
@@ -165,7 +152,7 @@ contract ConvexStrategyCVX is IStrategy, BaseUpgradeableStrategy {
   }
 
   /*
-  *   Withdraws all the asset to the vault
+  *   Withdraws the amount for the asset to the vault
   */
   function withdrawToVault(uint256 amount) public restricted {
     // Typically there wouldn't be any amount here
@@ -175,11 +162,31 @@ contract ConvexStrategyCVX is IStrategy, BaseUpgradeableStrategy {
     if(amount > entireBalance){
       // While we have the check above, we still using SafeMath below
       // for the peace of mind (in case something gets changed in between)
-      uint256 needToWithdraw = amount.sub(entireBalance);
-      uint256 toWithdraw = Math.min(rewardPoolBalance(), needToWithdraw);
-      partialWithdrawalRewardPool(toWithdraw);
+      uint256 needToWithdrawLOOKS = amount.sub(entireBalance);
+
+      uint256 canWithdrawLOOKS = Math.min(rewardPoolBalance(), needToWithdrawLOOKS);
+
+      // convert amount of underlying to withdraw to shares price
+      uint256 oneShareInLOOKS = IFeeSharingSystem(rewardPool()).calculateSharePriceInLOOKS();
+      uint256 sharesToWithdraw = canWithdrawLOOKS.mul(1e36).div(oneShareInLOOKS).div(1e18);
+
+      // bool flag param for claiming reward tokens set to false
+      IFeeSharingSystem(rewardPool()).withdraw(sharesToWithdraw, false);
     }
-    IERC20(underlying()).safeTransfer(vault(), amount);
+
+
+    // due to precision issues between shares -> LOOKS we might end up with getting a tiny amount
+    // of LOOKS less then requested. This rounding "error" is forwarded to the user, but we need to make sure
+    // that it is not too big. We add a tolerance threshold to check for that.
+    uint256 tolerance = 1e8;
+    uint256 underlyingBalance = IERC20(underlying()).balanceOf(address(this));
+    require(underlyingBalance.add(tolerance) >= amount, "Withdrawn rewardPool amount too far from requested amount");
+
+    // recalculate to improve accuracy. we either transfer the requested amount,
+    // or a tiny bit less as a potential outcome of precision between shares -> LOOKS
+    uint256 underlyingAmountToWithdraw = Math.min(amount, underlyingBalance);
+
+    IERC20(underlying()).safeTransfer(vault(), underlyingAmountToWithdraw);
   }
 
   /*
@@ -187,6 +194,14 @@ contract ConvexStrategyCVX is IStrategy, BaseUpgradeableStrategy {
   *   amount of reward that is accrued.
   */
   function investedUnderlyingBalance() external view returns (uint256) {
+    if (rewardPool() == address(0)) {
+      return IERC20(underlying()).balanceOf(address(this));
+    }
+
+    // Adding the amount locked in the reward pool and the amount that is somehow in this contract
+    // both are in the units of "underlying"
+    // The second part is needed because there is the emergency exit mechanism
+    // which would break the assumption that all the funds are always inside of the reward pool
     return rewardPoolBalance().add(IERC20(underlying()).balanceOf(address(this)));
   }
 
@@ -203,13 +218,12 @@ contract ConvexStrategyCVX is IStrategy, BaseUpgradeableStrategy {
   /*
   *   Get the reward, sell it in exchange for underlying, invest what you got.
   *   It's not much, but it's honest work.
-  *
-  *   Note that although `onlyNotPausedInvesting` is not added here,
-  *   calling `investAllUnderlying()` affectively blocks the usage of `doHardWork`
-  *   when the investing is being paused by governance.
   */
   function doHardWork() external onlyNotPausedInvesting restricted {
-    IcvxRewardPool(rewardPool()).getReward(address(this), true, false);
+    uint256 pendingRewards = IFeeSharingSystem(rewardPool()).calculatePendingRewards(address(this));
+    if (pendingRewards > 0) {
+      IFeeSharingSystem(rewardPool()).harvest();
+    }
     _liquidateReward();
     investAllUnderlying();
   }

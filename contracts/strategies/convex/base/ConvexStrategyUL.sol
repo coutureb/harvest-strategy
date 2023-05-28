@@ -4,25 +4,26 @@ import "@openzeppelin/contracts/math/Math.sol";
 import "@openzeppelin/contracts/math/SafeMath.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20Detailed.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
-import "../../base/interface/uniswap/IUniswapV2Router02.sol";
-import "../../base/interface/IStrategy.sol";
-import "../../base/interface/IVault.sol";
-import "../../base/upgradability/BaseUpgradeableStrategy.sol";
-import "../../base/interface/uniswap/IUniswapV2Pair.sol";
-import "./interface/IBooster.sol";
-import "./interface/IBaseRewardPool.sol";
-import "../../base/interface/curve/ICurveDeposit_2token.sol";
+import "../../../base/interface/uniswap/IUniswapV2Router02.sol";
+import "../../../base/interface/IStrategy.sol";
+import "../../../base/interface/IVault.sol";
+import "../../../base/upgradability/BaseUpgradeableStrategyUL.sol";
+import "../../../base/interface/uniswap/IUniswapV2Pair.sol";
+import "../interface/IBooster.sol";
+import "../interface/IBaseRewardPool.sol";
+import "../../../base/interface/curve/ICurveDeposit_2token.sol";
+import "../../../base/interface/curve/ICurveDeposit_3token.sol";
+import "../../../base/interface/curve/ICurveDeposit_4token.sol";
+import "../../../base/interface/curve/ICurveDeposit_4token_meta.sol";
 
-contract ConvexStrategy2Token is IStrategy, BaseUpgradeableStrategy {
+contract ConvexStrategyUL is IStrategy, BaseUpgradeableStrategyUL {
 
   using SafeMath for uint256;
   using SafeERC20 for IERC20;
 
-  address public constant uniswapRouterV2 = address(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
-  address public constant sushiswapRouterV2 = address(0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F);
   address public constant booster = address(0xF403C135812408BFbE8713b5A23a04b3D48AAE31);
   address public constant weth = address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
-  address public constant multiSigAddr = 0xF49440C1F012d041802b25A73e5B0B9166a75c02;
+  address public constant multiSigAddr = address(0xF49440C1F012d041802b25A73e5B0B9166a75c02);
 
   // additional storage slots (on top of BaseUpgradeableStrategy ones) are defined here
   bytes32 internal constant _POOLID_SLOT = 0x3fd729bfa2e28b7806b03a6e014729f59477b530f995be4d51defc9dad94810b;
@@ -32,14 +33,13 @@ contract ConvexStrategy2Token is IStrategy, BaseUpgradeableStrategy {
   bytes32 internal constant _CURVE_DEPOSIT_SLOT = 0xb306bb7adebd5a22f5e4cdf1efa00bc5f62d4f5554ef9d62c1b16327cd3ab5f9;
   bytes32 internal constant _HODL_RATIO_SLOT = 0xb487e573671f10704ed229d25cf38dda6d287a35872859d096c0395110a0adb1;
   bytes32 internal constant _HODL_VAULT_SLOT = 0xc26d330f887c749cb38ae7c37873ff08ac4bba7aec9113c82d48a0cf6cc145f2;
+  bytes32 internal constant _NTOKENS_SLOT = 0xbb60b35bae256d3c1378ff05e8d7bee588cd800739c720a107471dfa218f74c1;
+  bytes32 internal constant _METAPOOL_SLOT = 0x567ad8b67c826974a167f1a361acbef5639a3e7e02e99edbc648a84b0923d5b7;
 
   uint256 public constant hodlRatioBase = 10000;
-  address[] public WETH2deposit;
-  mapping (address => address[]) public reward2WETH;
-  mapping (address => bool) public useUni;
   address[] public rewardTokens;
 
-  constructor() public BaseUpgradeableStrategy() {
+  constructor() public BaseUpgradeableStrategyUL() {
     assert(_POOLID_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.poolId")) - 1));
     assert(_DEPOSIT_TOKEN_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.depositToken")) - 1));
     assert(_DEPOSIT_RECEIPT_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.depositReceipt")) - 1));
@@ -47,6 +47,8 @@ contract ConvexStrategy2Token is IStrategy, BaseUpgradeableStrategy {
     assert(_CURVE_DEPOSIT_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.curveDeposit")) - 1));
     assert(_HODL_RATIO_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.hodlRatio")) - 1));
     assert(_HODL_VAULT_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.hodlVault")) - 1));
+    assert(_NTOKENS_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.nTokens")) - 1));
+    assert(_METAPOOL_SLOT == bytes32(uint256(keccak256("eip1967.strategyStorage.metaPool")) - 1));
   }
 
   function initializeBaseStrategy(
@@ -57,39 +59,70 @@ contract ConvexStrategy2Token is IStrategy, BaseUpgradeableStrategy {
     uint256 _poolID,
     address _depositToken,
     uint256 _depositArrayPosition,
-    address _curveDeposit
+    address _curveDeposit,
+    uint256 _nTokens,
+    bool _metaPool,
+    uint256 _hodlRatio
   ) public initializer {
 
-    BaseUpgradeableStrategy.initialize(
+    // calculate profit sharing fee depending on hodlRatio
+    uint256 profitSharingNumerator = 300;
+    if (_hodlRatio >= 3000) {
+      profitSharingNumerator = 0;
+    } else if (_hodlRatio > 0){
+      // (profitSharingNumerator - hodlRatio/10) * hodlRatioBase / (hodlRatioBase - hodlRatio)
+      // e.g. with default values: (300 - 1000 / 10) * 10000 / (10000 - 1000)
+      // = (300 - 100) * 10000 / 9000 = 222
+      profitSharingNumerator = profitSharingNumerator.sub(_hodlRatio.div(10)) // subtract hodl ratio from profit sharing numerator
+                                    .mul(hodlRatioBase) // multiply with hodlRatioBase
+                                    .div(hodlRatioBase.sub(_hodlRatio)); // divide by hodlRatioBase minus hodlRatio
+    }
+
+    BaseUpgradeableStrategyUL.initialize(
       _storage,
       _underlying,
       _vault,
       _rewardPool,
       weth,
-      300,  // profit sharing numerator
+      profitSharingNumerator,  // profit sharing numerator
       1000, // profit sharing denominator
       true, // sell
       0, // sell floor
-      12 hours // implementation change delay
+      12 hours, // implementation change delay
+      address(0x7882172921E99d590E097cD600554339fBDBc480) //UL Registry
     );
 
     address _lpt;
     address _depositReceipt;
     (_lpt,_depositReceipt,,,,) = IBooster(booster).poolInfo(_poolID);
     require(_lpt == underlying(), "Pool Info does not match underlying");
-    require(_depositArrayPosition < 2, "Deposit array position out of bounds");
+    require(_depositArrayPosition < _nTokens, "Deposit array position out of bounds");
+    require(1 < _nTokens && _nTokens < 5, "_nTokens should be 2, 3 or 4");
     _setDepositArrayPosition(_depositArrayPosition);
     _setPoolId(_poolID);
     _setDepositToken(_depositToken);
     _setDepositReceipt(_depositReceipt);
     _setCurveDeposit(_curveDeposit);
-    setHodlRatio(1000);
-    setHodlVault(multiSigAddr);
-    WETH2deposit = new address[](0);
+    _setNTokens(_nTokens);
+    _setMetaPool(_metaPool);
+    setUint256(_HODL_RATIO_SLOT, 1000);
+    setAddress(_HODL_VAULT_SLOT, multiSigAddr);
     rewardTokens = new address[](0);
   }
 
   function setHodlRatio(uint256 _value) public onlyGovernance {
+    uint256 profitSharingNumerator = 300;
+    if (_value >= 3000) {
+      profitSharingNumerator = 0;
+    } else if (_value > 0){
+      // (profitSharingNumerator - hodlRatio/10) * hodlRatioBase / (hodlRatioBase - hodlRatio)
+      // e.g. with default values: (300 - 1000 / 10) * 10000 / (10000 - 1000)
+      // = (300 - 100) * 10000 / 9000 = 222
+      profitSharingNumerator = profitSharingNumerator.sub(_value.div(10)) // subtract hodl ratio from profit sharing numerator
+                                    .mul(hodlRatioBase) // multiply with hodlRatioBase
+                                    .div(hodlRatioBase.sub(_value)); // divide by hodlRatioBase minus hodlRatio
+    }
+    _setProfitSharingNumerator(profitSharingNumerator);
     setUint256(_HODL_RATIO_SLOT, _value);
   }
 
@@ -172,32 +205,8 @@ contract ConvexStrategy2Token is IStrategy, BaseUpgradeableStrategy {
     _setPausedInvesting(false);
   }
 
-  function setDepositLiquidationPath(address [] memory _route, bool _useUni) public onlyGovernance {
-    require(_route[0] == weth, "Path should start with WETH");
-    require(_route[_route.length-1] == depositToken(), "Path should end with depositToken");
-    WETH2deposit = _route;
-    useUni[_route[_route.length-1]] = _useUni;
-  }
-
-  function setRewardLiquidationPath(address [] memory _route, bool _useUni) public onlyGovernance {
-    require(_route[_route.length-1] == weth, "Path should end with WETH");
-    bool isReward = false;
-    for(uint256 i = 0; i < rewardTokens.length; i++){
-      if (_route[0] == rewardTokens[i]) {
-        isReward = true;
-      }
-    }
-    require(isReward, "Path should start with a rewardToken");
-    reward2WETH[_route[0]] = _route;
-    useUni[_route[0]] = _useUni;
-  }
-
-  function addRewardToken(address _token, address[] memory _path2WETH, bool _useUni) public onlyGovernance {
-    require(_path2WETH[_path2WETH.length-1] == weth, "Path should end with WETH");
-    require(_path2WETH[0] == _token, "Path should start with rewardToken");
+  function addRewardToken(address _token) public onlyGovernance {
     rewardTokens.push(_token);
-    reward2WETH[_token] = _path2WETH;
-    useUni[_token] = _useUni;
   }
 
   // We assume that all the tradings can be done on Sushiswap
@@ -211,7 +220,10 @@ contract ConvexStrategy2Token is IStrategy, BaseUpgradeableStrategy {
     for(uint256 i = 0; i < rewardTokens.length; i++){
       address token = rewardTokens[i];
       uint256 rewardBalance = IERC20(token).balanceOf(address(this));
-      if (rewardBalance == 0 || reward2WETH[token].length < 2) {
+      
+      // if the token is the rewardToken then there won't be a path defined because liquidation is not necessary,
+      // but we still have to make sure that the toHodl part is executed.
+      if (rewardBalance == 0 || (storedLiquidationDexes[token][rewardToken()].length < 1) && token != rewardToken()) {
         continue;
       }
 
@@ -224,21 +236,25 @@ contract ConvexStrategy2Token is IStrategy, BaseUpgradeableStrategy {
         }
       }
 
-      address routerV2;
-      if(useUni[token]) {
-        routerV2 = uniswapRouterV2;
-      } else {
-        routerV2 = sushiswapRouterV2;
+      if(token == rewardToken()) {
+        // one of the reward tokens is the same as the token that we liquidate to -> 
+        // no liquidation necessary
+        continue;
       }
-      IERC20(token).safeApprove(routerV2, 0);
-      IERC20(token).safeApprove(routerV2, rewardBalance);
+
+      IERC20(token).safeApprove(universalLiquidator(), 0);
+      IERC20(token).safeApprove(universalLiquidator(), rewardBalance);
       // we can accept 1 as the minimum because this will be called only by a trusted worker
-      IUniswapV2Router02(routerV2).swapExactTokensForTokens(
-        rewardBalance, 1, reward2WETH[token], address(this), block.timestamp
+      ILiquidator(universalLiquidator()).swapTokenOnMultipleDEXes(
+        rewardBalance,
+        1,
+        address(this), // target
+        storedLiquidationDexes[token][rewardToken()],
+        storedLiquidationPaths[token][rewardToken()]
       );
     }
 
-    uint256 rewardBalance = IERC20(weth).balanceOf(address(this));
+    uint256 rewardBalance = IERC20(rewardToken()).balanceOf(address(this));
 
     notifyProfitInRewardToken(rewardBalance);
     uint256 remainingRewardBalance = IERC20(rewardToken()).balanceOf(address(this));
@@ -247,26 +263,19 @@ contract ConvexStrategy2Token is IStrategy, BaseUpgradeableStrategy {
       return;
     }
 
-    address routerV2;
-    if(useUni[depositToken()]) {
-      routerV2 = uniswapRouterV2;
-    } else {
-      routerV2 = sushiswapRouterV2;
+    if(depositToken() != rewardToken()) {
+      IERC20(rewardToken()).safeApprove(universalLiquidator(), 0);
+      IERC20(rewardToken()).safeApprove(universalLiquidator(), remainingRewardBalance);
+
+      // we can accept 1 as minimum because this is called only by a trusted role
+      ILiquidator(universalLiquidator()).swapTokenOnMultipleDEXes(
+        remainingRewardBalance,
+        1,
+        address(this), // target
+        storedLiquidationDexes[rewardToken()][depositToken()],
+        storedLiquidationPaths[rewardToken()][depositToken()]
+      );
     }
-    // allow Uniswap to sell our reward
-    IERC20(rewardToken()).safeApprove(routerV2, 0);
-    IERC20(rewardToken()).safeApprove(routerV2, remainingRewardBalance);
-
-    // we can accept 1 as minimum because this is called only by a trusted role
-    uint256 amountOutMin = 1;
-
-    IUniswapV2Router02(routerV2).swapExactTokensForTokens(
-      remainingRewardBalance,
-      amountOutMin,
-      WETH2deposit,
-      address(this),
-      block.timestamp
-    );
 
     uint256 tokenBalance = IERC20(depositToken()).balanceOf(address(this));
     if (tokenBalance > 0) {
@@ -279,12 +288,25 @@ contract ConvexStrategy2Token is IStrategy, BaseUpgradeableStrategy {
     IERC20(depositToken()).safeApprove(curveDeposit(), 0);
     IERC20(depositToken()).safeApprove(curveDeposit(), tokenBalance);
 
-    uint256[2] memory depositArray;
-    depositArray[depositArrayPosition()] = tokenBalance;
-
     // we can accept 0 as minimum, this will be called only by trusted roles
     uint256 minimum = 0;
-    ICurveDeposit_2token(curveDeposit()).add_liquidity(depositArray, minimum);
+    if (nTokens() == 2) {
+      uint256[2] memory depositArray;
+      depositArray[depositArrayPosition()] = tokenBalance;
+      ICurveDeposit_2token(curveDeposit()).add_liquidity(depositArray, minimum);
+    } else if (nTokens() == 3) {
+      uint256[3] memory depositArray;
+      depositArray[depositArrayPosition()] = tokenBalance;
+      ICurveDeposit_3token(curveDeposit()).add_liquidity(depositArray, minimum);
+    } else if (nTokens() == 4) {
+      uint256[4] memory depositArray;
+      depositArray[depositArrayPosition()] = tokenBalance;
+      if (metaPool()) {
+        ICurveDeposit_4token_meta(curveDeposit()).add_liquidity(underlying(), depositArray, minimum);
+      } else {
+        ICurveDeposit_4token(curveDeposit()).add_liquidity(depositArray, minimum);
+      }
+    }
   }
 
 
@@ -417,6 +439,23 @@ contract ConvexStrategy2Token is IStrategy, BaseUpgradeableStrategy {
   function curveDeposit() public view returns (address) {
     return getAddress(_CURVE_DEPOSIT_SLOT);
   }
+
+  function _setNTokens(uint256 _value) internal {
+    setUint256(_NTOKENS_SLOT, _value);
+  }
+
+  function nTokens() public view returns (uint256) {
+    return getUint256(_NTOKENS_SLOT);
+  }
+
+  function _setMetaPool(bool _value) internal {
+    setBoolean(_METAPOOL_SLOT, _value);
+  }
+
+  function metaPool() public view returns (bool) {
+    return getBoolean(_METAPOOL_SLOT);
+  }
+
 
   function finalizeUpgrade() external onlyGovernance {
     _finalizeUpgrade();
